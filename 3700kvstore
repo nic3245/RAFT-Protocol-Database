@@ -1,0 +1,399 @@
+#!/usr/bin/env python3
+
+import argparse, socket, time, json, select, struct, sys, math, os
+import random
+
+BROADCAST = "FFFF"
+
+
+class Replica:
+    def __init__(self, port, id, others):
+        # Information for sending
+        self.port = port
+        self.id = id
+        self.others = others
+        self.socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.socket.bind(('localhost', 0))
+        self.socket.setblocking(False)
+        # Extra info for implementation purposes
+        self.timeout = random.randint(500, 1000) / 1000
+        self.last_heartbeat = time.perf_counter()
+        self.leader_heartbeats = [time.perf_counter() for _ in others]
+        self.state = 'follower'
+        self.num_votes = None
+        self.leader = BROADCAST
+        # Persistent state on all servers
+        self.current_term = 0
+        self.voted_for = None
+        # log is a list of lists, where each sublist is key, value, term, MID, client src
+        # Throughout the code it is 1 indexed
+        self.log = []
+        # Volatile state on all servers
+        self.commit_index = 0  # 1 indexed
+        self.last_applied = 0  # 1 indexed
+        # Volatile state on leaders
+        self.next_index = None  # 1 indexed
+        self.match_index = None  # 1 indexed
+        # Actual state machine
+        self.state_machine = {}
+
+        hello = {"src": self.id, "dst": BROADCAST, "leader": BROADCAST, "type": "hello"}
+        self.send(hello)
+
+    def send_append_rpc(self, dst, entries):
+        """
+        Sends an AppendEntries RPC to the destination with the given entries.
+        :param dst: destination to send the message to
+        :param entries: log entries to include in the message
+        """
+        # Heartbeat message, must be -1 b/c if entries[0] is first, then previous index is 0
+        if len(entries) == 0:
+            pLI = -1
+            pLT = -1
+        else:
+            pLI = self.log.index(entries[0])
+            pLT = self.log[self.log.index(entries[0])][2]
+        msg_to_send = {'src': self.id, 'dst': dst, 'leader': self.leader, 'type': 'aerpc', 'term': self.current_term,
+                       'pLI': pLI, 'pLT': pLT, 'entries': entries, 'lC': self.commit_index}
+
+        self.send(msg_to_send)
+
+    def handle_append_rpc(self, msg):
+        """
+        Responds to the given AppendEntries RPC
+        :param msg: the AppendEntries RPC to respond to
+        """
+        # Heartbeat message, or no previous entry to compare with
+        if msg['pLI'] < 1:
+            check_log = True
+        # Compare previous entries to make sure log of sender aligns with this log
+        else:
+            # If this log is shorter, then it does not align
+            if len(self.log) < msg['pLI']:
+                check_log = False
+            # If terms of previous entry don't match, it does not align
+            else:
+                check_log = self.log[msg['pLI'] - 1][2] == msg['pLT']
+        # Make sure leader is actually leader based on term and that the log is 'valid'
+        if msg['term'] < self.current_term or not check_log:
+            response = {'src': self.id, 'dst': msg['src'], 'leader': msg['leader'], 'type': 'aerpcR', 'r': False,
+                        'term': self.current_term}
+            self.send(response)
+        # Was a valid message, time to react
+        else:
+            # Log is always at least the size of msg['pLI'], and want to delete if larger
+            if msg['pLI'] == 0:
+                self.log = []
+            elif 0 < msg['pLI'] < len(self.log):
+                self.log = self.log[:msg['pLI'] - 1]
+            # Append any new entries not already in the log
+            for entry in msg['entries']:
+                self.log.append(entry)
+            # Update commit index based on leader's commit index
+            if msg['lC'] > self.commit_index:
+                self.commit_index = min(msg['lC'], len(self.log))
+            response = {'src': self.id, 'dst': msg['src'], 'leader': msg['leader'], 'type': 'aerpcR', 'r': True,
+                        'term': self.current_term, 'LI': len(self.log)}
+            self.send(response)
+            self.leader = msg['leader']
+        # Reset heartbeat timer
+        self.last_heartbeat = time.perf_counter()
+
+    def send_request_vote_rpc(self, dst):
+        """
+        Sends a RequestVote RPC to the given destination
+        :param dst: replica to send the message to
+        """
+        # Set up previous last term
+        if len(self.log) == 0:
+            pLT = 0
+        else:
+            pLT = self.log[-1][2]
+        msg_to_send = {'src': self.id, 'dst': dst, 'leader': self.leader, 'type': 'rvrpc',
+                       'term': self.current_term, 'pLI': len(self.log), 'pLT': pLT}
+        self.send(msg_to_send)
+
+    def handle_request_vote_rpc(self, msg):
+        """
+        Responds to the given RequestVote RPC
+        :param msg: the RequestVote RPC to respond to
+        """
+        # Check that the sender's log is up to date
+        if len(self.log) == 0:
+            log_up_to_date = True
+        elif msg['pLT'] > self.log[-1][2]:
+            log_up_to_date = True
+        else:
+            if msg['pLI'] >= len(self.log):
+                log_up_to_date = True
+            else:
+                log_up_to_date = False
+        # Check that term is higher, this hasn't voted yet, and the log is up to date
+        grant_vote = msg['term'] >= self.current_term and ((self.voted_for is None or self.voted_for == msg['src'])
+                                                           and log_up_to_date)
+        # Grant the vote
+        if grant_vote:
+            self.voted_for = msg['src']
+        response = {'src': self.id, 'dst': msg['src'], 'leader': self.leader, 'type': 'rvrpcR', 'r': grant_vote,
+                    'term': self.current_term}
+        self.send(response)
+
+    def send(self, message):
+        """
+        Send the fully formed, unencoded message over localhost
+        :param message: json-formatted variable to send
+        """
+        self.socket.sendto(json.dumps(message).encode('utf-8'), ('localhost', self.port))
+
+    def run(self):
+        # Run forever
+        while True:
+            self.update_state_machine()
+
+            # Use select to wait until there's data to read from the socket
+            readable, _, _ = select.select([self.socket], [], [], .2)
+            msg = ''
+            for s in readable:
+                if s is self.socket:
+                    data, addr = self.socket.recvfrom(65535)
+                    msg = data.decode('utf-8')
+            # Try to respond to the message
+            try:
+                msg = json.loads(msg)
+                if self.state == 'follower':
+                    self.respond_as_follower(msg)
+
+                elif self.state == 'candidate':
+                    self.respond_as_candidate(msg)
+
+                elif self.state == 'leader':
+                    self.respond_as_leader(msg)
+
+            # Nothing to read from socket
+            except json.JSONDecodeError:
+                pass
+
+            # Runs every time
+            if self.state == 'leader':
+
+                # Either send the uncommitted log entries or a heartbeat
+                self.leader_send_log_or_heartbeat()
+
+                # Update commit_index
+                while self.check_commit_to_state(self.commit_index + 1):
+                    self.commit_index += 1
+
+            # Check if election timeout
+            if not self.state == 'leader':
+                self.check_election_timeout()
+
+    def check_election_timeout(self):
+        """
+        Check if this replica should timeout, and promote to a candidate if it should.
+        """
+        if time.perf_counter() - self.last_heartbeat > self.timeout:
+            if not self.state == 'leader':
+                self.state = 'candidate'
+                self.current_term += 1
+                self.voted_for = self.id
+                self.last_heartbeat = time.perf_counter()
+                self.num_votes = 1
+                self.send_request_vote_rpc(BROADCAST)
+
+    def leader_send_log_or_heartbeat(self):
+        """
+        Check if it is time to send to follower, and send AppendEntries RPC if it is.
+        """
+        for i in range(len(self.next_index)):
+            if time.perf_counter() - self.leader_heartbeats[i] > 0.1:
+                if len(self.log) > 0 and len(self.log) >= self.next_index[i]:
+                    self.send_append_rpc(self.others[i], self.log[self.next_index[i] - 1:])
+                    self.leader_heartbeats[i] = time.perf_counter()
+                else:
+                    self.send_append_rpc(self.others[i], [])
+                    self.leader_heartbeats[i] = time.perf_counter()
+
+    def respond_as_leader(self, msg):
+        """
+        Handle a message and respond if necessary as a leader.
+        :param msg: the message to respond to
+        """
+        # Save to log and attempt to commit to state machine later
+        if msg['type'] == 'put':
+            self.log.append([msg['key'], msg['value'], self.current_term, msg['MID'], msg['src']])
+        # Either respond with fail if it doesn't exit or the saved value if it does
+        elif msg['type'] == 'get':
+            if msg['key'] in self.state_machine:
+                response = {'src': self.id, 'dst': msg['src'], 'leader': self.leader, 'type': 'ok',
+                            'MID': msg['MID'], 'value': self.state_machine[msg['key']]}
+            else:
+                response = {'src': self.id, 'dst': msg['src'], 'leader': self.leader, 'type': 'fail',
+                            'MID': msg['MID']}
+            self.send(response)
+        # Revert to follower if sender should be true leader (higher term)
+        elif msg['type'] == 'aerpc':
+            if msg['term'] > self.current_term:
+                for fail in self.log[self.last_applied + 1:]:
+                    response = {'src': self.id, 'dst': fail[4], 'leader': self.leader, 'type': 'fail',
+                                'MID': fail[3]}
+                    self.send(response)
+                self.convert_to_follower(msg['term'])
+                self.handle_append_rpc(msg)
+                self.last_heartbeat = time.perf_counter()
+        # Revert to follower if sender should be true leader (higher term)
+        elif msg['type'] == 'rvrpc':
+            if msg['term'] > self.current_term:
+                self.convert_to_follower(msg['term'])
+                self.handle_request_vote_rpc(msg)
+        # AppendEntries RPC Response
+        elif msg['type'] == 'aerpcR':
+            # If the response is false
+            if not msg['r']:
+                # If false b/c term higher, then revert to follower
+                if msg['term'] > self.current_term:
+                    self.convert_to_follower(msg['term'])
+                # If false b/c not matching logs, decrease next index and try again later
+                else:
+                    server_i = self.others.index(msg['src'])
+                    self.next_index[server_i] -= 1
+            # If the response is true
+            else:
+                # Update the next index and match index
+                server_i = self.others.index(msg['src'])
+                self.next_index[server_i] = msg['LI'] + 1
+                self.match_index[server_i] = msg['LI']
+
+    def respond_as_candidate(self, msg):
+        """
+        Handle a message and respond if necessary as a candidate.
+        :param msg: the message to respond to
+        """
+        # RequestVote RPC Response
+        if msg['type'] == 'rvrpcR':
+            # If responder has a better term, revert to follower
+            if msg['term'] > self.current_term:
+                self.convert_to_follower(msg['term'])
+            # If the response is true, replica was granted vote
+            if msg['r']:
+                self.num_votes += 1
+            # If this now has enough votes, promote itself to leader
+            if self.num_votes > (len(self.others) + 1) / 2:
+                self.convert_to_leader()
+        # If another leader, revert to follower if it has better term
+        elif msg['type'] == 'aerpc':
+            if msg['term'] >= self.current_term:
+                self.convert_to_follower(msg['term'])
+            self.handle_append_rpc(msg)
+        # If another candidate, revert to follower if it has a better term
+        elif msg['type'] == 'rvrpc':
+            if msg['term'] > self.current_term:
+                self.convert_to_follower(msg['term'])
+                self.handle_request_vote_rpc(msg)
+        # Respond to get and put with temporary redirects
+        elif msg['type'] == 'put' or msg['type'] == 'get':
+            response = {"src": self.id, "dst": msg['src'], "leader": self.leader, "type": "redirect",
+                        "MID": msg['MID']}
+            self.send(response)
+
+    def respond_as_follower(self, msg):
+        """
+        Handle a message and respond if necessary as a follower.
+        :param msg: the message to respond to
+        """
+        # Handle an AppendEntries RPC
+        if msg['type'] == 'aerpc':
+            if msg['term'] > self.current_term:
+                self.convert_to_follower(msg['term'])
+            self.last_heartbeat = time.perf_counter()
+            self.handle_append_rpc(msg)
+        # Handle a RequestVote RPC
+        elif msg['type'] == 'rvrpc':
+            if msg['term'] > self.current_term:
+                self.convert_to_follower(msg['term'])
+            self.last_heartbeat = time.perf_counter()
+            self.handle_request_vote_rpc(msg)
+        # Respond to get and put with redirects to leader
+        elif msg['type'] == 'put' or msg['type'] == 'get':
+            response = {"src": self.id, "dst": msg['src'], "leader": self.leader, "type": "redirect",
+                        "MID": msg['MID']}
+            self.send(response)
+
+    def update_state_machine(self):
+        """
+        Updates state machine.
+        """
+        while self.commit_index > self.last_applied:
+            try:
+                to_append = self.log[self.last_applied - 1]
+            except IndexError:
+                print("Got an index error when getting message from log to commit to state.")
+
+            self.state_machine[to_append[0]] = to_append[1]
+            if self.state == 'leader':
+                self.send_ok_to_client(to_append[4], to_append[3])
+            self.last_applied += 1
+
+    def check_commit_to_state(self, n_to_check):
+        """
+        Check whether the number is valid for committing to state
+        :param n_to_check: number to check
+        :return: true if commit_index can be increased to the given number, false O.W.
+        """
+        server_num = 0
+        for server_max_index in self.match_index:
+            if server_max_index >= n_to_check:
+                server_num += 1
+        return server_num > (len(self.others) + 1) / 2
+
+    def convert_to_follower(self, ct):
+        """
+        Reset this replica to the follower state
+        :param ct: term to start this follower at
+        """
+        self.state = 'follower'
+        self.last_heartbeat = time.perf_counter()
+        self.num_votes = None
+        self.current_term = ct
+        self.voted_for = None
+        self.next_index = None
+        self.match_index = None
+
+    def convert_to_leader(self):
+        """
+        Promote this replica into the leader state
+        """
+        # Extra info for implementation purposes
+        self.last_heartbeat = time.perf_counter()
+        self.state = 'leader'
+        self.num_votes = None
+        self.leader = self.id
+        # Persistent state on all servers
+        self.voted_for = None
+        # Volatile state on leaders
+        self.next_index = [len(self.log) for _ in self.others]
+        self.match_index = [0 for _ in self.others]
+        self.send_append_rpc(BROADCAST, [])
+
+    def send_ok_to_client(self, dst, mid):
+        """
+        Send an ok response for the given MID to the given destination
+        :param dst: the destination to send the response to
+        :param mid: message id that is being ok'd
+        :return:
+        """
+        response = {'src': self.id, 'dst': dst, 'leader': self.leader, 'type': 'ok',
+                    'MID': mid}
+        self.send(response)
+
+
+if __name__ == "__main__":
+    # Set up command line arguments
+    parser = argparse.ArgumentParser(description='run a key-value store')
+    parser.add_argument('port', type=int, help="Port number to communicate")
+    parser.add_argument('id', type=str, help="ID of this replica")
+    parser.add_argument('others', metavar='others', type=str, nargs='+', help="IDs of other replicas")
+    args = parser.parse_args()
+    # Set up this replica
+    replica = Replica(args.port, args.id, args.others)
+    # Start the replica
+    replica.run()

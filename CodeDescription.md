@@ -1,0 +1,14 @@
+### High-level approach: 
+
+Our high level approach focused on emulating the given raft paper while adapting it to the environment given. We start by setting up the command line arguments and getting the replica up and running. Once it is running, it will run a main loop forever. Inside this main loop, the funcitonality will differ based on whether the replica is a follower, candidate, or leader. However, some functionality is always shared - the replica will update its state machine if necessary, read in a message if one is available, and respond to the message. This response changes based on the state of the replica. After handling the message if one is available, the replica will take the necessary leader actions (sending AppendEntries RPCs) if it is a leader, or possibly timeout and start an election if it is not a leader.
+
+The approach to handling the specifics of the environment was to let the RAFT protocol do the heavy lifting for us. By implementing the elections, timeouts, and messages correctly, no extra work is needed to account for the lossy environment or leader failures.
+
+### Challenges we faced:
+
+This is not to say that we implemented the RAFT protocol perfectly at first, though. There were challenges with leader failures causing elections to act weirdly, index errors when applying to state machine, and certain get requests returning an incorrect value. In the end, these were all small logical errors in our code: for leader failures, we were promoting for (number of other servers) / 2 votes, instead of (total servers + 1) / 2 votes. The index error was coming from a missing = in what should've been a <= for comparison, and the get messages returning incorrectly were because of a slight error in not promoting the cadidate with the most up-to-date log. Although slightly difficult to find, having a solid grasp of the RAFT protocol let us think through what would cause these bugs and narrow down our search.
+
+
+### Testing Overview:
+
+The code was largely tested with the given config and run files. It was built one step at a time (like was outlined in the spec), and each step was run multiple times to ensure that it was working before moving on to the next. Large numbers of print statements as well as prints at set times were used to aid in the testing and debugging process, as otherwise there is no sure way to know what each replica has for its variables or what it is doing. Testing in this way was slightly tedious as it required scanning through output pretty manually (with the help of ctrl + f), but it was doable and helped us ensure that our code was acting as we intended.
